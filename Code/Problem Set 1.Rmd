@@ -1,0 +1,552 @@
+---
+title: "ECON 293 - Problem Set 1"
+author: "Jacob Light"
+date: "4/29/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, include=FALSE, warning=FALSE, message = FALSE}
+  library(tidyr)
+  library(dplyr)
+  library(stringr)
+  library(readr)
+  library(ggplot2)
+  library(rmarkdown)
+  library(kableExtra)
+  library(utils)
+  library(readxl)
+  library(glmnet)
+  library(haven)
+  library(sandwich)
+  library(rpart)
+
+```
+
+
+\section{Part 1 - Randomized Experiment}
+
+```{r readsas, include = FALSE, warning = FALSE, message = FALSE}
+  # Load randomized experiment data
+  star_data <- read_sav('../Input/STAR_students.sav') %>%
+    mutate(treatment = if_else(g1classtype == 1, 1, if_else(g1classtype == 2, 0, -1))) %>%
+    filter(treatment != -1, !is.na(g1freelunch)) %>%
+    select(stdntid, treatment, g1freelunch, g1readbsobjpct, g1mathbsobjpct, 
+           gender, race, birthyear, FLAGSGK, g1surban, g1schid, g1tchid, g1tgen, 
+           g1trace, g1thighdegree, g1tcareer, g1tyears, g1speced) %>%
+    # Clean and rename variables for sensible interpretation
+    mutate(student_id_char = as.character(stdntid),
+           school_id_fac = as.factor(g1schid),
+           teach_id_fac = as.factor(g1tchid),
+           free_lunch = 2 - g1freelunch,
+           teacher_female = 2 - g1tgen,
+           student_female = 2 - gender,
+           student_nonwhite = as.numeric(race > 1),
+           student_race_fac = as.factor(race),
+           student_birthyear = birthyear,
+           treatment_group = treatment,
+           participate_kdg = FLAGSGK,
+           school_urbanicity_factor = as.factor(g1surban),
+           teacher_nonwhite = as.numeric(g1trace > 1),
+           teacher_mastersplus = as.numeric(g1thighdegree > 2),
+           teacher_career_factor = as.factor(g1tcareer),
+           teacher_experience = g1tyears,
+           teacher_experience_sq = g1tyears ^ g1tyears,
+           special_education = 2 - g1speced,
+           read_score = g1readbsobjpct,
+           math_score = g1mathbsobjpct) %>%
+    # Restrict to nonmissing entries 
+    select(contains('_')) %>%
+    .[complete.cases(.), ] %>%
+    # Pivot data frame
+    pivot_longer(cols = contains('score'), names_to = 'test', values_to = 'score') %>%
+    mutate(test = str_replace(test, '_score', '')) %>%
+    rename(treatment = treatment_group)
+
+
+
+
+```
+
+
+```{r true_ate, warning=FALSE, message = FALSE}
+  # Start with STAR dataset, constructed using STAR_students.sav and Comparison_students.sav
+  # datasets. Restrict to observations for which first grade test score are available, select
+  # score data, student id, and common demographic characteristics (race, gender, birth year).
+  # Assume, for this exercise, that this sample represents a randomized experiment.
+  ate <- function(df) {
+    df %>%
+      group_by(treatment, test) %>%
+      mutate(score = if_else(treatment == 0, -score, score)) %>%
+      summarize(avg = mean(score), var = var(score), count = n()) %>%
+      mutate(se = sqrt(var / (count - 1))) %>%
+      group_by(test) %>%
+      summarize(ate = sum(avg),
+                se = sum(se),
+                ci_low = ate - 1.96 * se,
+                ci_high = ate + 1.96 * se)
+  }
+  summary <- ate(star_data)
+
+  kable(summary,
+      caption = 'Baseline ATE - STAR Sample',
+      digits = 2)
+
+```
+
+
+1. For my replication and modification study, I estimate the effect of assignment to a small class on first-grade reading and math scores using data from the the Tennessee STAR experiment . For the purposes of this exercise, I assume that treatment selection and attrition are entirely random and proceed with a sample comprised of students for whom I can observe treatment status, first-grade reading and math scores, age, sex, and birth year.
+Table 1 summarizes the baseline ATE estimate, standard error, and confidence intervals for first grade reading and math proficiency scores. The scores measure the percent of grade level standards a student mastered. The treatment effect can be interepreted as suggesting that assignment to a smaller classroom in the STAR experiment changed expected reading proficiency by `r summary$ate[summary$test == 'g1readbsobjpct']` and math proficiency by `r summary$ate[summary$test == 'g1mathbsobjpct']`.
+
+```{r dif_mean, echo = FALSE}
+  # Difference in means - P(treatment)
+  summary2 <- ate(star_data %>%
+                    # filter(test == 'math') %>%
+                    select(treatment, free_lunch, test) %>%
+                    rename(score = treatment,
+                           treatment = free_lunch))
+  summary2 <- tibble(avg_treat = mean(star_data$free_lunch[star_data$treatment == 1]),
+                     avg_control = mean(star_data$free_lunch[star_data$treatment == 0]),
+                     dif = summary2$ate,
+                     se = summary2$se,
+                     ci_low = summary2$ci_low,
+                     ci_high = summary2$ci_high)
+  summary2 <- summary2[1, ]
+
+  # Summary average performance by free/reduced group
+  summary3 <- bind_rows(ate(star_data %>% filter(free_lunch == 1)) %>% mutate(free_lunch = 1),
+                        ate(star_data %>% filter(free_lunch == 0)) %>% mutate(free_lunch = 0)) %>%
+      select(free_lunch, everything()) %>%
+      arrange(free_lunch)
+
+  kable(summary2,
+        caption = 'Difference in Means Test - P(Free Lunch) by Treatment Group',
+        digits = 4)
+  
+  kable(summary3 %>% arrange(test, free_lunch),
+        caption = 'Difference in Performance by Free Lunch Status',
+        digits = c(0, 0, 1, 1, 0))
+
+```
+
+
+2. Under randomization, 48% of treated students and 51% of control students are eligible for free/reduced price lunch. This difference is not significant Suppose that the study did not properly balance socioeconomic status in the sample, such that students in the treatment group were substantially more likely to be free/reduced price lunch students than control students. Following the procedure in the tutorial, I drop 50% of free/reduced price students from the control group and 50% of non-free/reduced price students from the treatment group, such that the respective groups are more heavily skewed on the free/reduced price dimension. From the remaining observations, I further confound on gender: I drop 20% of boys in the control group and 20% of girls in the treatment. The table below summarizes the ATE in reading and math scores for this new confounded sample. The counfounded treatment effect estimates are substantially higher for both reading and math scores, although overlap on covariates has been preserved. The table below estimates confounded treatment effects.
+
+```{r ate_confounded, echo=FALSE, warning=FALSE, message = FALSE}
+  # Drop 55% of free/reduced price treated students, 55% of non-free/reduced price control students
+  pct <- 0.5
+  pct_gender <- 0.2
+  ids_to_drop <- bind_rows(star_data %>%
+                             filter(treatment == 1, free_lunch == 0) %>%
+                             sample_frac(pct) %>%
+                             select(student_id_char),
+                           star_data %>%
+                             filter(treatment == 0, free_lunch == 1) %>%
+                             sample_frac(pct) %>%
+                             select(student_id_char))
+  data_confound <- star_data[(star_data$student_id_char %in% ids_to_drop$student_id_char) == FALSE, ]
+  
+  ids_to_drop <- bind_rows(data_confound %>%
+                             filter(treatment == 1, student_female == 0) %>%
+                             sample_frac(pct_gender) %>%
+                             select(student_id_char),
+                           data_confound %>%
+                             filter(treatment == 0, student_female == 1) %>%
+                             sample_frac(pct_gender) %>%
+                             select(student_id_char))
+  data_confound <- star_data[(star_data$student_id_char %in% ids_to_drop$student_id_char) == FALSE, ]
+  
+  # Confounded ATE
+  ate_confounded <- ate(data_confound)
+  kable(ate_confounded,
+      caption = 'ATE Confounded on Free/Reduced Lunch Status',
+      digits = 2)   
+  
+
+```
+
+
+3. The table below summarizes treatment effect estimates using inverse propensity weighting, OLS regression, and double robust analysis. The STAR data are somewhat limited for estimating causal questions using a large set of covariates - the STAR experiment staggered treatment start (some students drop out of the kindergarten cohort and are not observed again, some students enter the study during first grade), so there is only a small set of baseline demographic controls not affected by treatment that I can use to generate interactions. For the purposes of this exercise, I expand the number of covariates by interacting all of the baseline covariates (race, free/reduced lunch status, gender, birth year, and a vector of teacher characteristics), then re-run the three estimation procedures. With only slight modifications to the regression procedures, the effect on estimated ATE is relatively small. The initial IPW and expanded dataset IPW estimates are anomalous.
+The table also includes lasso and regression tree model estimates. After introducing a large set of interaction terms in the previous regressions, we might be concerned that we are over-fitting our model to the data. While a highly-fitted model increases in-sample fit, we also want the model to be flexible for out-of-sample fit. Thus, in lasso regression, we introduce a penalty for over-fitting to force the model to choose only the most informative covariates to include in the analysis. The lasso penalty function sends any unimportant parameters (specifically, if the benefit from fit is less than the size of the parameter estimate) to 0. The size of this penalty is not obvious from theory, so we would analytically choose the penalty term $\lambda$ by splitting the sample into test and train samples and choosing the term $\hat{\lambda}$ that maximizes the out-of-sample fit on the test sample. In the figure below, I plot $\lambda$ against the number of nonzezro terms included in the regression - as $\lambda$ grows, the penalty for including a relatively uninformative covariate shrinks and we begin to push those coefficient estimates to 0.
+Next, I run a regression tree model on the math test score data (restrict to only the math scores for simplicity). I include all of the covariates (without interactions) in the model, as the regression tree allows for the nonlinearities I simulated with interaction terms. At each branch of the regression tree, the algorithm splits a region of the sample into two sub-regions and calculates the average math score in the region. The algorithm can run until each observation is its own leaf, which maximizes in-sample fit but raises concerns about over-fitting. Thus, I split the data into train and test samples and use cross-validation to find the number of splits that maximizes out-of-sample fit. I estimate the regression tree ATE using this tuning parameter. I plot the first few branches of the regression tree below.  
+
+```{r star_regs, echo=FALSE, warning=FALSE}
+  # Clean data frame for regression
+  df <- data_confound %>%
+    select(-contains(c("fac", 'char')))
+  df_math <- df %>% 
+    filter(test == 'math') %>%
+    select(-test)
+  df_read <- df %>%
+    filter(test == 'read') %>%
+    select(-test)
+
+  # 1 - OLS
+  ate_condmean_ols <- function(dat, inter) {
+    df_mod_centered = data.frame(scale(dat, center = TRUE, scale = FALSE))
+    if (inter == 0) {
+      lm.interact = lm(score ~ ., data = df_mod_centered)
+    } else if (inter == 1) {
+      lm.interact = lm(score ~ . * free_lunch, data = df_mod_centered)
+    }
+    tau.hat = as.numeric(coef(lm.interact)["treatment"])
+    se.hat = as.numeric(sqrt(vcovHC(lm.interact)["treatment", "treatment"]))
+    c(ATE=tau.hat, lower_ci = tau.hat - 1.96 * se.hat, upper_ci = tau.hat + 1.96 * se.hat)
+  }
+  tauhat_ols_math <- ate_condmean_ols(df_math, 0)
+  tauhat_ols_read <- ate_condmean_ols(df_read, 0)
+  tauhat_ols_math_inter <- ate_condmean_ols(df_math, 1)
+  tauhat_ols_read_inter <- ate_condmean_ols(df_read, 1)  
+  
+  # 2 - Inv prop weight
+  ipw <- function(dataset, inter, p = TRUE) {
+    if(is.logical(p) == TRUE) {
+      if(inter == 0) {
+        p <- glm(treatment ~ ., 
+                 family = "binomial",
+                 dataset) %>%
+          predict(type = 'response')
+      } else if (inter == 1) {
+        p <- glm(treatment ~ . * free_lunch, 
+                 family = "binomial",
+                 dataset) %>%
+          predict(type = 'response')      
+      }
+    }
+    W <- dataset$treatment
+    Y <- dataset$score
+    G <- ((W - p) * Y) / (p * (1 - p))
+    tau.hat <- mean(G)
+    se.hat <- sqrt(var(G) / (length(G) - 1))
+    c(ATE=tau.hat, lower_ci = tau.hat - 1.96 * se.hat, upper_ci = tau.hat + 1.96 * se.hat)
+  }
+  tauhat_ipw_math <- ipw(df_math, 0)
+  tauhat_ipw_read <- ipw(df_read, 0)
+  tauhat_ipw_math_inter <- ipw(df_math, 1)
+  tauhat_ipw_read_inter <- ipw(df_read, 1)
+  
+  # 3 - Double Robust
+  aipw_ols <- function(dataset, inter) {
+    if(inter == 0) {
+      p <- glm(treatment ~ . , 
+               family = "binomial",
+               dataset) %>%
+        predict(type = 'response')
+    } else if (inter == 1) {
+      p <- glm(treatment ~ . * ., 
+               family = "binomial",
+               dataset) %>%
+        predict(type = 'response')      
+    }
+    
+    df_mod_centered = data.frame(scale(dataset, center = TRUE, scale = FALSE))
+    if (inter == 0) {
+      ols.fit = lm(score ~ ., data = df_mod_centered)
+    } else if (inter == 1) {
+      ols.fit = lm(score ~ . * free_lunch, data = df_mod_centered)
+    }
+    dataset.treatall = dataset
+    dataset.treatall$W = 1
+    treated_pred = predict(ols.fit, dataset.treatall)
+    
+    dataset.treatnone = dataset
+    dataset.treatnone$W = 0
+    control_pred = predict(ols.fit, dataset.treatnone)
+    
+    actual_pred = predict(ols.fit, dataset)
+    
+    G <- treated_pred - control_pred +
+      ((dataset$treatment - p) * (dataset$score - actual_pred)) / (p * (1 - p))
+    tau.hat <- mean(G)
+    se.hat <- sqrt(var(G) / (length(G) - 1))
+    c(ATE=tau.hat, lower_ci = tau.hat - 1.96 * se.hat, upper_ci = tau.hat + 1.96 * se.hat)
+  }
+  tauhat_dbl_math <- aipw_ols(df_math, 0)
+  tauhat_dbl_read <- aipw_ols(df_read, 0)
+  tauhat_dbl_math_inter <- aipw_ols(df_math, 1)
+  tauhat_dbl_read_inter <- aipw_ols(df_read, 1)
+  
+  ####################
+  # Lasso
+  ####################
+  Xmod.int = model.matrix(~ . * ., 
+                          data = data_confound %>%
+                            filter(test == 'math') %>%
+                            select(-test, -treatment, -contains("fac"), -contains("char"), -score))
+  Wmod <- data_confound %>%
+    filter(test == 'math') %>%
+    select(treatment) %>%
+    as.matrix()
+  # Fit model
+  glmnet.fit.propensity = glmnet::cv.glmnet(Xmod.int, Wmod, family = "binomial", keep=T) 
+  p_lasso = glmnet.fit.propensity$fit.preval[, glmnet.fit.propensity$lambda == 
+                                               glmnet.fit.propensity$lambda.min]
+  # {plot(smooth.spline(p_lasso, Wmod, df = 4)) abline(0, 1)}
+
+  # Run lasso regression
+  Xmod.for.lasso = cbind(Wmod, Xmod.int, as.numeric(2 * Wmod - 1) * Xmod.int)
+  y_math <- data_confound %>%
+    filter(test == 'math') %>%
+    select(score) %>%
+    as.matrix()
+  y_read <- data_confound %>%
+    filter(test == 'read') %>%
+    select(score) %>%
+    as.matrix() 
+  
+  ind <- 0
+  lasso_control <- list()
+  lasso_treat <- list()
+  for(y in list(y_math, y_read)) {
+      ind <- ind + 1
+      glmnet.fit.propensity = glmnet::cv.glmnet(Xmod.for.lasso, y, penalty.factor = 
+                                              c(0, rep(1, ncol(Xmod.for.lasso) - 1)), keep=T)
+      lasso_control[[ind]] = predict(glmnet.fit.propensity, cbind(0, Xmod.int, -Xmod.int)) 
+      lasso_treat[[ind]] = predict(glmnet.fit.propensity, cbind(1, Xmod.int, -Xmod.int))
+  }
+  tauhat_lasso_math <- c(ATE = mean(lasso_treat[[1]] - lasso_control[[1]]),
+                  lower_ci = NA,
+                  upper_ci = NA)
+  tauhat_lasso_read <- c(ATE = mean(lasso_treat[[2]] - lasso_control[[2]]),
+                  lower_ci = NA,
+                  upper_ci = NA)
+  plo <- tibble(lambda = glmnet.fit.propensity$lambda,
+                nonzero_coefs = glmnet.fit.propensity$nzero)
+  qplot(x = lambda, y = nonzero_coefs, data = plo, main = 'Nonzero Coefficients by Tuning Parameter')
+  
+  # Inverse propensity weights
+  tauhat_lasso_math_ipw = ipw(df_math, 0, p_lasso)
+  tauhat_lasso_read_ipw = ipw(df_read, 0, p_lasso)
+  
+  ####################
+  # Regression Tree
+  ####################
+  Xmod.int_scale = scale(data_confound %>%
+                            filter(test == 'math') %>%
+                            select(-test, -treatment, -contains("fac"), -contains("char"), -score))
+  process_scaled <- list(math = data.frame(scale(y_math),
+                                           Wmod,
+                                           Xmod.int_scale),
+                         read = data.frame(scale(y_read),
+                                           Wmod,
+                                           Xmod.int_scale))
+  smplmain <- sample(nrow(process_scaled[['math']]), 
+                     round(9*nrow(process_scaled[['math']])/10), replace=FALSE)
+  process_scaled[['math_train']] <- process_scaled[['math']][smplmain,] 
+  process_scaled[['math_test']] <- process_scaled[['math']][-smplmain,]
+  process_scaled[['read_train']] <- process_scaled[['read']][smplmain,] 
+  process_scaled[['read_test']] <- process_scaled[['read']][-smplmain,]
+  sumx <- paste(colnames(data_confound %>%
+                            filter(test == 'math') %>%
+                            select(-test, -treatment, -contains("fac"), -contains("char"), -score)),
+                collapse = " + ") 
+  linear <- paste("score",paste("treatment",sumx, sep=" + "), sep=" ~ ")
+  linear <- as.formula(linear)
+  linear.singletree <- rpart(formula = linear, data = process_scaled[['math_train']],
+                         method = "anova", y = TRUE,
+                         control = rpart.control(cp=1e-04, minsplit=30))
+  # Plot cross-validation
+  plotcp(linear.singletree)
+  
+  # Prune
+  op.index <- which.min(linear.singletree$cptable[, "xerror"])
+  cp.vals <- linear.singletree$cptable[, "CP"]
+  treepruned.linearsingle <- prune(linear.singletree, cp = cp.vals[op.index])
+  
+  # Plot tree
+  singletree.pred.class <- predict(treepruned.linearsingle, newdata= process_scaled[['math_test']])
+
+  # plot tree
+  visual.pruned.tree <- prune(linear.singletree, cp = 0.003)
+  plot(visual.pruned.tree, uniform=TRUE,
+       main="Visualize The First Few Layers of The Tree")
+  text(visual.pruned.tree, use.n=TRUE, all=TRUE, cex=.7)
+  
+  # Reg tree ATE:
+  tauhat_tree_math = predict(treepruned.linearsingle, process_scaled[['math']])
+  tauhat_tree_math = tibble(y = tauhat_tree_math,
+                            w = Wmod)
+  tauhat_tree_math <- tauhat_tree_math %>%
+    group_by(w) %>%
+    mutate(y = (2 * w - 1) * y) %>%
+    summarize(ate = mean(y)) %>%
+    summarize(ATE = sum(ate))
+  
+  # Create a table
+  out_math <- bind_rows(tauhat_ols_math,
+                   tauhat_ols_math_inter,
+                   tauhat_ipw_math,
+                   tauhat_ipw_math_inter,
+                   tauhat_dbl_math,
+                   tauhat_dbl_math_inter,
+                   tauhat_lasso_math,
+                   tauhat_lasso_math_ipw,
+                   tauhat_tree_math) %>%
+    mutate(type = c('OLS', 'OLS w/ Interactions', 
+    'Inverse Propensity Weight', 'Inverse Propensity Weight w/ Interactions',
+    'Double Robust', 'Double Robust w/ Interactions',
+    'Lasso OLS', 'Lasso IPW', 'Regression Tree')) %>%
+    select(type, everything())
+  out_read <- bind_rows(tauhat_ols_read,
+                   tauhat_ols_read_inter,
+                   tauhat_ipw_read,
+                   tauhat_ipw_read_inter,
+                   tauhat_dbl_read,
+                   tauhat_dbl_read_inter,
+                   tauhat_lasso_read,
+                   tauhat_lasso_read_ipw) %>%
+    mutate(type = c('OLS', 'OLS w/ Interactions', 
+      'Inverse Propensity Weight', 'Inverse Propensity Weight w/ Interactions',
+      'Double Robust', 'Double Robust w/ Interactions',
+      'Lasso OLS', 'Lasso IPW')) %>%
+    select(type, everything())
+  
+  # Print output
+  kable(out_math, caption = "Treatment Effect Estiamtes - Math Score",
+        digits = c(0, 2, 2, 2))
+  kable(out_read, caption = "Treatment Effect Estiamtes - Reading Score",
+        digits = c(0, 2, 2, 2))
+  
+
+```
+
+
+4. The previous tables compare treatment effect estimates for the confounded dataset using the methods specified in the problem set (OLS, inverse propensity weight, double robust, lasso, regression tree, and higher-dimension models). Clearly, most of the answers are not reasonable or what I would have expected, so I'll discuss some of the issues I encoutered in estimation in the hopes of uncovering some areas where I made mistakes. The esimates that produce the most reasonable treatment effect estimates are OLS and the Lasso OLS. We would expect OLS to better fit the underlying data because OLS does not include any regularization as we increase the dimensions of the covariate matrix. The inverse propensity weight regressions are not working as we might expect. I am not sure if this is a result of the trimming/confounding exercise or some underlying bug in my code. The regression tree estimates for the math score treatment effect are also quite small - I do not have a strong prior to explain this issue.
+
+\section{Part 2 - Propensity Stratification}
+
+1. Estimating propensity scores extracts from a treatment assignment indicator any portion of assignment that can be explained by non-random factors. Among observations with identical propensity scores, treatment status can be considered random and we can apply our usual potential outcomes framework to estimate treatment effects local to individuals with a given propensity score. Stratifying a sample on propensity scores subsets a larger sample into subsamples with similar propensity scores, where in sufficiently large samples with sufficiently many strata, we approximate potential outcomes setting of a random sample. We'd then take a weighted average of consistently-estimated point estimates, which will yield a consistent estimate of the ATE.
+
+```{r ate_estimation}
+  ate_estimate <- function(X, prop, K = 5) {
+    # x is a list object containing a matrix
+    # of covariates, a vector of treatment dummies,
+    # and a vector of outcomes. K is the number
+    # of strata chosen by the user
+    
+    # 1 - True ATE
+    tib <- tibble(y = X$outcome, w = X$treatment, e_x = X$propensity) %>%
+      mutate(invprop = y * w / e_x - y * (1 - w) / (1 - e_x))
+    ate_true <- tibble(type = "True ATE",
+                          point_estimate = mean(tib$invprop))
+                          # sq_error = (mean(tib$invprop) - ate_meandif$point_estimate) ^ 2
+    
+    # 2 - Inverse propensity weight
+    tib <- tibble(y = X$outcome, w = X$treatment, e_x = prop) %>%
+      mutate(invprop = y * w / e_x - y * (1 - w) / (1 - e_x))
+    ate_invprop <- tibble(type = "Inverse Propensity Weight",
+                          point_estimate = mean(tib$invprop))
+                          # sq_error = (mean(tib$invprop) - ate_meandif$point_estimate) ^ 2
+                          # ci_low = mean(tib$invprop) - 1.96 * 
+                          #   sqrt(var(tib$invprop) / (dim(tib)[1] - 1)),
+                          # ci_high = mean(tib$invprop) + 1.96 * 
+                          #   sqrt(var(tib$invprop) / (dim(tib)[1] - 1)))    
+    
+    # 3 - Stratified treatment effect
+      # a - stratify sample into K strata
+      tib$quantile <- ntile(x = tib$e_x, n = K)
+      
+      # b - calculate within-stratum ATE
+      ate_strat <- tib %>%
+        group_by(w, quantile) %>%
+        summarize(e_y = mean(y), n_w = n(), v = var(y)) %>%
+        ungroup() %>%
+        # Ensure that each stratum is populated by treated and control individuals
+        group_by(quantile) %>%
+        mutate(check = (max(w) == 1 & min(w) == 0)) %>%
+        filter(check == TRUE) %>%
+        select(-check) %>%
+        mutate(v = v / n_w) %>%  
+        # Calculate local treatment effect
+        mutate(e_y = if_else(w == 0, -1 * e_y, e_y)) %>%
+        group_by(quantile) %>%
+        summarize(effect = sum(e_y), n = sum(n_w), v = sum(v)) %>%
+        mutate(ate = effect * n / sum(n),
+               v = sqrt(v)) %>%
+        select(ate) %>%
+        sum() %>%
+        as.numeric()
+      ate_strat <- tibble(type = "Stratified ATE",
+                          point_estimate = ate_strat)
+                          # sq_error = (ate_strat - ate_meandif$point_estimate) ^ 2)
+      
+    return(list(ate_true = ate_true,
+                ate_invprop = ate_invprop,
+                ate_strat = ate_strat))
+    
+  }
+
+
+```
+
+2. The above function `ate_estimate` returns a matrix continaing point estimates and confidence intervals for randomized, inverse propensity-weighted, and stratified ATEs. The function accepts as an argument the number of strata `K`, which is limited to be less than $2N$, the smallest possible number of strata in which a local treatment effect could be estimated. The function as written drops strata that do not contain at least one treated and at least one control observation and calculates the stratified ATE across all strata for which an ATE can be estimated. This approach is likely most appropriate in a context where treatment status is heavily confounded. If we are not going to control for the dissimilarity of treated and control observations, it might be more sensible to restrict the sample to a region where control and treated individuals are more comparable and think of the treatment effect as a local treatment effect. Alternatively, we might run into an issue of strata where the ATE cannot be estimated because the strata are too small and all observations have the same treatment status by chance. Dropping these strata should not introduce bias into the point estimate but will increase the variance.
+
+
+```{r simulation}
+  # 1 - Generate dataset
+  set.seed(400)
+  datagen <- function(m = 3) {
+    n <- 1000
+    p <- 20
+    X <- matrix(rnorm(n * p), n, p)
+    propensity = pmax(0.2, pmin(0.8, 0.5 + X[,1]/3)) 
+    W <- rbinom(n, 1, propensity) 
+    Y <- pmax(X[,1] + W * X[,2], 0) + rnorm(n)
+    return(list(covariates = X,
+                treatment = W,
+                outcome = Y,
+                propensity = propensity))
+  }
+
+
+```
+
+3. Using the code provided, I simulate a dataset. The average treatment effect is calculated in the table below.
+
+```{r estimate}
+  data_estimator <- function(X) {
+    # 1 - run logistic regression of W on X
+    prop <- glm(X$treatment ~ X$covariates, family = 'binomial') %>%
+      predict(type = 'response')
+    
+    # 2 - Estimate treatment effects
+    ate_estimate(X, prop, 5)
+  }
+  
+  # Generate data frame, apply data_estimator function, print confidence intervals
+  df <- datagen()
+  out <- data_estimator(df)
+  kable(out %>% bind_rows(),
+        caption = 'Compare Treatment Effect Estimates by Method')
+
+```
+
+
+4. The table above estimates ATEs using inverse-propensity weighted and propensity-stratified methods. I estimate propensity scores using a logistic regression. I estimate the propensity-stratified ATE with 5 strata, as is common in the literature (e.g. Rosenbaum and Rubin 1983). The optimal choice of number of strata balances the bias-reduction of estimating local treatment effects and imprecision of strata estimates when strata are unbalanced or too small. An alternate approach might have been to use a machine learning method to balance the bias and variance reduction in the choice of the number of strata. The "True ATE" is an inverse-propensity weighted ATE using the propensity scores generated in the data generation code, rather than the logistic estimate.
+
+```{r mse}
+  # Repeat 20 times
+  sim_20 <- lapply(1:20, datagen) %>%
+    lapply(data_estimator) %>%
+    lapply(bind_rows) %>%
+    bind_rows() %>%
+    mutate(iter = cumsum(if_else(type == "True ATE", 1, 0))) %>%
+    group_by(iter) %>%
+    mutate(true = cumsum(if_else(type == "True ATE", point_estimate, 0)),
+           sq_error = (point_estimate - true) ^ 2) %>%
+    ungroup() %>%
+    group_by(type) %>%
+    summarize(mse = mean(sq_error))
+  
+  # Table
+  kable(sim_20,
+        caption = "Mean Square Error by Method", digits = 4)
+  
+
+```
+
+5. In the table above, I replicate the method in #4 on 20 simulated data frames and calcualte the MSE in average treatment effect. Stratification on propensity score minimizes the MSE relative to inverse propensity weighting - inverse propensity weighting introduces additional error by boosting certain observations and dampening others in the estimation. Thus, we'd expect the inverse propensity weighting method to be slightly noisier than the stratified method.
+
